@@ -4,17 +4,23 @@ Run this ONCE locally to generate the GOOGLE_CREDENTIALS_JSON secret.
 
 Steps:
   1. pip install google-auth-oauthlib
-  2. Download your OAuth 2.0 client secret from Google Cloud Console
-     (APIs & Services → Credentials → OAuth 2.0 Client ID → Download JSON)
-     Save it as client_secret.json in this directory.
+  2. Go to Google Cloud Console > APIs & Services > Credentials
+     Create an OAuth 2.0 Client ID (Desktop app type)
+     Enable both the Google Drive API and Gmail API in your project.
+     Download the JSON and save it as client_secret.json here.
   3. python scripts/get_google_token.py
-  4. Copy the printed JSON into GitHub → Settings → Secrets → GOOGLE_CREDENTIALS_JSON
+     A browser window will open — sign in and grant access to Drive + Gmail.
+  4. Copy the printed JSON into:
+     GitHub repo > Settings > Secrets and variables > Actions > GOOGLE_CREDENTIALS_JSON
 """
 
 import json
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 
 flow = InstalledAppFlow.from_client_secrets_file("client_secret.json", SCOPES)
 creds = flow.run_local_server(port=0)
@@ -28,5 +34,5 @@ output = {
     "scopes": list(creds.scopes),
 }
 
-print("\n✓ Add this as your GOOGLE_CREDENTIALS_JSON GitHub secret:\n")
+print("\nAdd this as your GOOGLE_CREDENTIALS_JSON GitHub secret:\n")
 print(json.dumps(output, indent=2))

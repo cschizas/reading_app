@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Daily reading email: picks a random file from the Drive library,
-summarises it with Claude, and sends it via Gmail SMTP.
+summarises it with Claude, and sends it via Gmail API (OAuth).
 
 Required env vars:
   ANTHROPIC_API_KEY       – Anthropic API key
-  GMAIL_APP_PASSWORD      – 16-char Gmail app password (not your account password)
   GOOGLE_CREDENTIALS_JSON – JSON string produced by scripts/get_google_token.py
+                            Must include both drive.readonly and gmail.send scopes.
 """
 
 import base64
@@ -14,7 +14,6 @@ import io
 import json
 import os
 import random
-import smtplib
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -41,9 +40,9 @@ READABLE_MIME_TYPES = {
 IMAGE_MIME_TYPES = {"image/jpeg", "image/jpg", "image/png"}
 
 
-# ── Drive helpers ────────────────────────────────────────────────────────────
+# ── Google auth ──────────────────────────────────────────────────────────────
 
-def get_drive_service():
+def get_google_credentials():
     data = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
     creds = Credentials(
         token=data.get("token"),
@@ -51,15 +50,16 @@ def get_drive_service():
         token_uri=data.get("token_uri", "https://oauth2.googleapis.com/token"),
         client_id=data["client_id"],
         client_secret=data["client_secret"],
-        scopes=data.get("scopes", ["https://www.googleapis.com/auth/drive.readonly"]),
+        scopes=data.get("scopes"),
     )
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-    return build("drive", "v3", credentials=creds)
+    return creds
 
+
+# ── Drive helpers ────────────────────────────────────────────────────────────
 
 def list_readable_files(service, folder_id):
-    """Recursively collect all supported files in the folder tree."""
     files = []
     page_token = None
     while True:
@@ -107,7 +107,6 @@ def read_file_content(service, file):
 
 def generate_summary(file, content, mime):
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-
     instruction = (
         "Analyse this reading material and produce exactly two sections:\n\n"
         "EXECUTIVE SUMMARY\n"
@@ -116,43 +115,27 @@ def generate_summary(file, content, mime):
         "4-6 bullet points (each starting with '- ') with the main ideas and "
         "memorable details. Bold the concept name before the dash or colon."
     )
-
     if mime in IMAGE_MIME_TYPES:
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": mime, "data": content},
-                    },
-                    {"type": "text", "text": instruction},
-                ],
-            }
-        ]
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": mime, "data": content}},
+                {"type": "text", "text": instruction},
+            ],
+        }]
     else:
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    f'Summarise this reading titled "{file["name"]}".\n\n'
-                    f"{content[:15000]}\n\n{instruction}"
-                ),
-            }
-        ]
-
-    resp = client.messages.create(
-        model="claude-opus-4-8",
-        max_tokens=2000,
-        messages=messages,
-    )
+        messages = [{
+            "role": "user",
+            "content": f'Summarise this reading titled "{file["name"]}".\n\n{content[:15000]}\n\n{instruction}',
+        }]
+    resp = client.messages.create(model="claude-opus-4-8", max_tokens=2000, messages=messages)
     return resp.content[0].text
 
 
 # ── Email building ───────────────────────────────────────────────────────────
 
 def _parse_summary(raw):
-    exec_sum, key_concepts_html = raw, ""
+    exec_sum, kc_html = raw, ""
     if "EXECUTIVE SUMMARY" in raw and "KEY CONCEPTS" in raw:
         after_exec = raw.split("EXECUTIVE SUMMARY", 1)[1]
         exec_part, kc_part = after_exec.split("KEY CONCEPTS", 1)
@@ -169,8 +152,8 @@ def _parse_summary(raw):
                 a, b = line.split(": ", 1)
                 line = f"<strong>{a.strip()}</strong>: {b.strip()}"
             items.append(f"<li>{line}</li>")
-        key_concepts_html = "\n".join(items)
-    return exec_sum, key_concepts_html
+        kc_html = "\n".join(items)
+    return exec_sum, kc_html
 
 
 def build_email(file, summary):
@@ -178,9 +161,7 @@ def build_email(file, summary):
     title = file["name"]
     for ext in (".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc"):
         title = title.replace(ext, "")
-    drive_link = file.get(
-        "webViewLink", f"https://drive.google.com/file/d/{file['id']}/view"
-    )
+    drive_link = file.get("webViewLink", f"https://drive.google.com/file/d/{file['id']}/view")
     exec_sum, kc_html = _parse_summary(summary)
 
     html = f"""<!DOCTYPE html>
@@ -218,33 +199,33 @@ def build_email(file, summary):
 </body></html>"""
 
     subject = f"Today's reading: {title}"
-    return subject, html, summary  # plain-text fallback = raw summary
+    return subject, html, summary
 
 
-# ── Sending ──────────────────────────────────────────────────────────────────
+# ── Sending via Gmail API ────────────────────────────────────────────────────
 
-def send_email(subject, html_body, plain_body):
-    pwd = os.environ["GMAIL_APP_PASSWORD"]
+def send_email(gmail_service, subject, html_body, plain_body):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECIPIENT_EMAIL
     msg.attach(MIMEText(plain_body, "plain"))
     msg.attach(MIMEText(html_body, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(SENDER_EMAIL, pwd)
-        server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
     print(f"Sent: {subject}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print("Connecting to Drive...")
-    service = get_drive_service()
+    print("Authenticating with Google...")
+    creds = get_google_credentials()
+    drive_service = build("drive", "v3", credentials=creds)
+    gmail_service = build("gmail", "v1", credentials=creds)
 
     print("Listing files...")
-    files = list_readable_files(service, DRIVE_FOLDER_ID)
+    files = list_readable_files(drive_service, DRIVE_FOLDER_ID)
     if not files:
         raise RuntimeError("No readable files found in the Drive folder.")
     print(f"Found {len(files)} files.")
@@ -253,14 +234,14 @@ def main():
     print(f"Selected: {chosen['name']} ({chosen['mimeType']})")
 
     print("Reading content...")
-    content = read_file_content(service, chosen)
+    content = read_file_content(drive_service, chosen)
 
     print("Generating summary with Claude...")
     summary = generate_summary(chosen, content, chosen["mimeType"])
 
     print("Building and sending email...")
     subject, html, plain = build_email(chosen, summary)
-    send_email(subject, html, plain)
+    send_email(gmail_service, subject, html, plain)
 
 
 if __name__ == "__main__":

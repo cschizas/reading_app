@@ -4,7 +4,7 @@ on:
   schedule:
     # 06:00 UTC = 09:00 Athens (EEST, summer) / 08:00 (EET, winter)
     - cron: '0 6 * * *'
-  workflow_dispatch:   # ← lets you trigger a test run manually from GitHub UI
+  workflow_dispatch:   # trigger a test run manually from the GitHub Actions tab
 
 jobs:
   send-reading:
@@ -27,6 +27,5 @@ jobs:
       - name: Send reading email
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python scripts/send_reading.py
