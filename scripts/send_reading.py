@@ -5,8 +5,7 @@ summarises it with Claude, and sends it via Gmail API (OAuth).
 
 Required env vars:
   ANTHROPIC_API_KEY       - Anthropic API key
-  GOOGLE_CREDENTIALS_JSON - JSON string produced by scripts/get_google_token.py
-                            Must include drive.readonly and gmail.send scopes.
+  GOOGLE_CREDENTIALS_JSON - JSON string with drive.readonly + gmail.send scopes
 """
 
 import base64
@@ -15,6 +14,7 @@ import json
 import os
 import random
 from datetime import datetime, timedelta, timezone
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -30,10 +30,9 @@ RECIPIENT_EMAIL = "christos.schizas@gmail.com"
 SENDER_EMAIL = "christos.schizas@gmail.com"
 HISTORY_FILE = Path("data/sent_history.json")
 
-COOLDOWN_PRIMARY = timedelta(days=90)   # don't resend within 3 months
-COOLDOWN_FALLBACK = timedelta(days=30)  # fallback: at least 1 month old
+COOLDOWN_PRIMARY = timedelta(days=90)
+COOLDOWN_FALLBACK = timedelta(days=30)
 
-# MIME types we can meaningfully read and summarise
 READABLE_MIME_TYPES = {
     "application/pdf",
     "application/vnd.google-apps.document",
@@ -43,8 +42,6 @@ READABLE_MIME_TYPES = {
     "image/jpg",
     "image/png",
 }
-
-# Types explicitly skipped (logged for visibility)
 EXCLUDED_MIME_TYPES = {
     "application/vnd.google-apps.spreadsheet",
     "application/vnd.ms-excel",
@@ -55,11 +52,10 @@ EXCLUDED_MIME_TYPES = {
     "application/vnd.google-apps.form",
     "application/vnd.google-apps.drawing",
 }
-
 IMAGE_MIME_TYPES = {"image/jpeg", "image/jpg", "image/png"}
 
 
-# ── Google auth ──────────────────────────────────────────────────────────────
+# ── Google auth ───────────────────────────────────────────────────────────────
 
 def get_google_credentials():
     data = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
@@ -76,7 +72,7 @@ def get_google_credentials():
     return creds
 
 
-# ── Sent history ─────────────────────────────────────────────────────────────
+# ── Sent history ──────────────────────────────────────────────────────────────
 
 def load_history():
     if HISTORY_FILE.exists():
@@ -94,36 +90,25 @@ def save_history(history, file_id, title):
 
 
 def pick_file(files, history):
-    """
-    Priority:
-      1. Files never sent or not sent in the last 90 days  (primary pool)
-      2. Files not sent in the last 30 days               (fallback pool)
-      3. The single file sent least recently              (last resort)
-    """
     now = datetime.now(timezone.utc)
 
     def last_sent(f):
         entry = history.get(f["id"])
         if not entry:
             return None
-        ts = entry["last_sent"]
-        dt = datetime.fromisoformat(ts)
-        # Make timezone-aware if stored without tzinfo
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        dt = datetime.fromisoformat(entry["last_sent"])
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
     primary = [f for f in files if last_sent(f) is None or last_sent(f) < now - COOLDOWN_PRIMARY]
     if primary:
-        print(f"Primary pool: {len(primary)} file(s) available.")
+        print(f"Primary pool ({len(primary)} files — not sent in 90d).")
         return random.choice(primary)
 
     fallback = [f for f in files if last_sent(f) is None or last_sent(f) < now - COOLDOWN_FALLBACK]
     if fallback:
-        print(f"Fallback pool ({COOLDOWN_FALLBACK.days}d cooldown): {len(fallback)} file(s) available.")
+        print(f"Fallback pool ({len(fallback)} files — not sent in 30d).")
         return random.choice(fallback)
 
-    # Last resort: pick the file sent longest ago
     print("All files sent recently — picking the oldest-sent file.")
     return min(files, key=lambda f: last_sent(f) or datetime.min.replace(tzinfo=timezone.utc))
 
@@ -131,7 +116,6 @@ def pick_file(files, history):
 # ── Drive helpers ─────────────────────────────────────────────────────────────
 
 def list_readable_files(service, folder_id):
-    """Recursively collect readable files; log and skip unsupported types."""
     files = []
     page_token = None
     while True:
@@ -153,7 +137,7 @@ def list_readable_files(service, folder_id):
             elif mime in READABLE_MIME_TYPES:
                 files.append(f)
             elif mime in EXCLUDED_MIME_TYPES:
-                print(f"  Skipped (unsupported type {mime}): {f['name']}")
+                print(f"  Skipped ({mime}): {f['name']}")
             else:
                 print(f"  Skipped (unknown type {mime}): {f['name']}")
         page_token = resp.get("nextPageToken")
@@ -175,9 +159,8 @@ def read_file_content(service, file):
     while not done:
         _, done = dl.next_chunk()
     buf.seek(0)
-    if mime in IMAGE_MIME_TYPES:
-        return base64.b64encode(buf.read()).decode("utf-8")
-    return buf.read().decode("utf-8", errors="replace")
+    # Always return raw bytes for images (we need them for embedding)
+    return buf.read()
 
 
 # ── Summarisation ─────────────────────────────────────────────────────────────
@@ -185,27 +168,27 @@ def read_file_content(service, file):
 def generate_summary(file, content, mime):
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     instruction = (
-        "Analyse this reading material and produce exactly two sections:\n\n"
+        "Write in a casual, conversational tone — like you're telling a smart friend about something interesting you read. No jargon, no fluff.\n\n"
         "EXECUTIVE SUMMARY\n"
-        "3-4 sentences capturing the core takeaway.\n\n"
+        "2 sentences max. What's the core idea and why does it matter?\n\n"
         "KEY CONCEPTS\n"
-        "4-6 bullet points (each starting with '- ') with the main ideas and "
-        "memorable details. Bold the concept name before the dash or colon."
+        "3-5 bullet points (start each with '- '). One punchy line each. Bold the concept name."
     )
     if mime in IMAGE_MIME_TYPES:
         messages = [{
             "role": "user",
             "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": mime, "data": content}},
+                {"type": "image", "source": {"type": "base64", "media_type": mime, "data": base64.b64encode(content).decode()}},
                 {"type": "text", "text": instruction},
             ],
         }]
     else:
+        text_content = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else content
         messages = [{
             "role": "user",
-            "content": f'Summarise this reading titled "{file["name"]}".\n\n{content[:15000]}\n\n{instruction}',
+            "content": f'Summarise this reading: "{file["name"]}"\n\n{text_content[:15000]}\n\n{instruction}',
         }]
-    resp = client.messages.create(model="claude-opus-4-8", max_tokens=2000, messages=messages)
+    resp = client.messages.create(model="claude-opus-4-8", max_tokens=1000, messages=messages)
     return resp.content[0].text
 
 
@@ -233,7 +216,7 @@ def _parse_summary(raw):
     return exec_sum, kc_html
 
 
-def build_email(file, summary):
+def build_mime_message(file, summary, image_bytes=None, image_mime=None):
     today = datetime.now().strftime("%A, %-d %B %Y")
     title = file["name"]
     for ext in (".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc"):
@@ -241,55 +224,75 @@ def build_email(file, summary):
     drive_link = file.get("webViewLink", f"https://drive.google.com/file/d/{file['id']}/view")
     exec_sum, kc_html = _parse_summary(summary)
 
+    img_tag = '<img src="cid:reading_img" style="max-width:100%;border-radius:6px;margin-top:4px;">' if image_bytes else ""
+
     html = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8">
 <style>
-  body{{font-family:Georgia,serif;max-width:680px;margin:0 auto;color:#1a1a1a}}
-  .hdr{{background:#1a2744;color:#fff;padding:28px 32px;border-radius:8px 8px 0 0}}
-  .hdr h1{{margin:0 0 6px;font-size:20px}}.hdr p{{margin:0;font-size:13px;color:#aec6f0}}
-  .body{{padding:28px 32px;border:1px solid #e0e0e0;border-top:none;border-radius:0 0 8px 8px}}
-  .lbl{{font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
-        color:#1a2744;margin:24px 0 10px;border-bottom:2px solid #1a2744;padding-bottom:4px}}
-  .summ{{background:#f4f7fb;border-left:4px solid #1a2744;padding:16px 18px;
-         font-size:15px;line-height:1.7;margin:0}}
+  body{{font-family:Georgia,serif;max-width:660px;margin:0 auto;color:#1a1a1a}}
+  .hdr{{background:#1a2744;color:#fff;padding:22px 28px;border-radius:8px 8px 0 0}}
+  .hdr h1{{margin:0 0 4px;font-size:18px;font-weight:bold}}
+  .hdr p{{margin:0;font-size:12px;color:#aec6f0}}
+  .body{{padding:24px 28px;border:1px solid #e0e0e0;border-top:none;border-radius:0 0 8px 8px}}
+  .lbl{{font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
+        color:#1a2744;margin:20px 0 8px;border-bottom:2px solid #1a2744;padding-bottom:3px}}
+  .summ{{background:#f4f7fb;border-left:4px solid #1a2744;padding:12px 16px;
+         font-size:14px;line-height:1.6;margin:0}}
   ul{{list-style:none;padding:0;margin:0}}
-  li{{padding:10px 0;border-bottom:1px solid #f0f0f0;font-size:14px;line-height:1.65}}
+  li{{padding:8px 0;border-bottom:1px solid #f0f0f0;font-size:13px;line-height:1.55}}
   li:last-child{{border-bottom:none}}
-  .btn{{display:inline-block;background:#1a2744;color:#fff!important;padding:10px 20px;
+  .btn{{display:inline-block;background:#1a2744;color:#fff!important;padding:9px 18px;
         border-radius:5px;text-decoration:none;font-size:13px;font-weight:700}}
-  .foot{{margin-top:24px;font-size:11px;color:#aaa;text-align:center;
-         border-top:1px solid #eee;padding-top:14px}}
+  .foot{{margin-top:20px;font-size:11px;color:#aaa;text-align:center;
+         border-top:1px solid #eee;padding-top:12px}}
 </style>
 </head>
 <body>
 <div class="hdr"><h1>{title}</h1><p>{today}</p></div>
 <div class="body">
-  <div class="lbl">Executive Summary</div>
+  <div class="lbl">The gist</div>
   <p class="summ">{exec_sum}</p>
-  <div class="lbl">Key Concepts</div>
+  <div class="lbl">Key takeaways</div>
   <ul>{kc_html}</ul>
-  <div class="lbl">Source</div>
+  {f'<div class="lbl">Visual</div>{img_tag}' if image_bytes else ""}
+  <div class="lbl">Read it</div>
   <p><a class="btn" href="{drive_link}">Open in Google Drive →</a></p>
   <div class="foot">Daily reading · {RECIPIENT_EMAIL}</div>
 </div>
 </body></html>"""
 
-    return f"Today's reading: {title}", html, summary
+    subject = f"Today's read: {title}"
+
+    # Build MIME structure
+    if image_bytes:
+        msg = MIMEMultipart("related")
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(summary, "plain"))
+        alt.attach(MIMEText(html, "html"))
+        msg.attach(alt)
+        subtype = (image_mime or "image/jpeg").split("/")[1].replace("jpg", "jpeg")
+        img_part = MIMEImage(image_bytes, _subtype=subtype)
+        img_part.add_header("Content-ID", "<reading_img>")
+        img_part.add_header("Content-Disposition", "inline")
+        msg.attach(img_part)
+    else:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(summary, "plain"))
+        msg.attach(MIMEText(html, "html"))
+
+    msg["Subject"] = subject
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = RECIPIENT_EMAIL
+    return msg
 
 
 # ── Sending via Gmail API ─────────────────────────────────────────────────────
 
-def send_email(gmail_service, subject, html_body, plain_body):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = RECIPIENT_EMAIL
-    msg.attach(MIMEText(plain_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
+def send_email(gmail_service, msg):
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     gmail_service.users().messages().send(userId="me", body={"raw": raw}).execute()
-    print(f"Sent: {subject}")
+    print(f"Sent: {msg['Subject']}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -316,12 +319,16 @@ def main():
     print("Reading content...")
     content = read_file_content(drive_service, chosen)
 
-    print("Generating summary with Claude...")
-    summary = generate_summary(chosen, content, chosen["mimeType"])
+    mime = chosen["mimeType"]
+    image_bytes = content if mime in IMAGE_MIME_TYPES else None
+    image_mime = mime if mime in IMAGE_MIME_TYPES else None
 
-    print("Sending email...")
-    subject, html, plain = build_email(chosen, summary)
-    send_email(gmail_service, subject, html, plain)
+    print("Generating summary with Claude...")
+    summary = generate_summary(chosen, content, mime)
+
+    print("Building and sending email...")
+    msg = build_mime_message(chosen, summary, image_bytes=image_bytes, image_mime=image_mime)
+    send_email(gmail_service, msg)
 
     print("Updating sent history...")
     save_history(history, chosen["id"], chosen["name"])
