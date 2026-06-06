@@ -14,6 +14,8 @@ import json
 import os
 import random
 from datetime import datetime, timedelta, timezone
+from email import encoders
+from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -147,42 +149,48 @@ def list_readable_files(service, folder_id):
 
 
 def read_file_content(service, file):
+    """Returns (content_for_summary, attach_bytes, attach_mime)."""
     mime = file["mimeType"]
     fid = file["id"]
 
-    # Google Docs: export as plain text directly
+    # Google Docs: export plain text for summary, PDF for attachment
     if mime == "application/vnd.google-apps.document":
         raw = service.files().export(fileId=fid, mimeType="text/plain").execute()
-        return raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        pdf_bytes = service.files().export(fileId=fid, mimeType="application/pdf").execute()
+        return text, pdf_bytes, "application/pdf"
 
-    # Download the raw file
+    # Download the raw file once
     request = service.files().get_media(fileId=fid, supportsAllDrives=True)
     buf = io.BytesIO()
     dl = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
         _, done = dl.next_chunk()
-    buf.seek(0)
+    raw_bytes = buf.getvalue()
 
-    # Images: return raw bytes for inline embedding
+    # Images: raw bytes for inline embedding and attachment
     if mime in IMAGE_MIME_TYPES:
-        return buf.read()
+        return raw_bytes, raw_bytes, mime
 
-    # PDFs: extract text with pdfplumber
+    # PDFs: extract text with pdfplumber, attach original PDF
     if mime == "application/pdf":
         import pdfplumber
-        with pdfplumber.open(buf) as pdf:
+        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
             pages = [page.extract_text() or "" for page in pdf.pages]
-        return "\n\n".join(p for p in pages if p.strip())
+        text = "\n\n".join(p for p in pages if p.strip())
+        return text, raw_bytes, "application/pdf"
 
-    # Word .docx: extract text with python-docx
+    # Word .docx: extract text with python-docx, attach original file
     if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
         import docx
-        doc = docx.Document(buf)
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        doc = docx.Document(io.BytesIO(raw_bytes))
+        text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        return text, raw_bytes, mime
 
     # Fallback for .doc and others
-    return buf.read().decode("utf-8", errors="replace")
+    text = raw_bytes.decode("utf-8", errors="replace")
+    return text, raw_bytes, mime
 
 
 # ── Summarisation ─────────────────────────────────────────────────────────────
@@ -238,7 +246,11 @@ def _parse_summary(raw):
     return exec_sum, kc_html
 
 
-def build_mime_message(file, summary, image_bytes=None, image_mime=None):
+MAX_ATTACH_BYTES = 20 * 1024 * 1024  # 20 MB — Gmail API limit is 25 MB
+
+
+def build_mime_message(file, summary, image_bytes=None, image_mime=None,
+                       attach_bytes=None, attach_filename=None, attach_mime=None):
     today = datetime.now().strftime("%A, %-d %B %Y")
     title = file["name"]
     for ext in (".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc"):
@@ -286,22 +298,38 @@ def build_mime_message(file, summary, image_bytes=None, image_mime=None):
 
     subject = f"Today's read: {title}"
 
-    # Build MIME structure
+    # Build the body part
     if image_bytes:
-        msg = MIMEMultipart("related")
+        body = MIMEMultipart("related")
         alt = MIMEMultipart("alternative")
         alt.attach(MIMEText(summary, "plain"))
         alt.attach(MIMEText(html, "html"))
-        msg.attach(alt)
+        body.attach(alt)
         subtype = (image_mime or "image/jpeg").split("/")[1].replace("jpg", "jpeg")
         img_part = MIMEImage(image_bytes, _subtype=subtype)
         img_part.add_header("Content-ID", "<reading_img>")
         img_part.add_header("Content-Disposition", "inline")
-        msg.attach(img_part)
+        body.attach(img_part)
     else:
-        msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(summary, "plain"))
-        msg.attach(MIMEText(html, "html"))
+        body = MIMEMultipart("alternative")
+        body.attach(MIMEText(summary, "plain"))
+        body.attach(MIMEText(html, "html"))
+
+    # Wrap in multipart/mixed when attaching the file
+    if attach_bytes and len(attach_bytes) <= MAX_ATTACH_BYTES:
+        msg = MIMEMultipart("mixed")
+        msg.attach(body)
+        maintype, subtype = (attach_mime or "application/octet-stream").split("/", 1)
+        att = MIMEBase(maintype, subtype)
+        att.set_payload(attach_bytes)
+        encoders.encode_base64(att)
+        att.add_header("Content-Disposition", "attachment", filename=attach_filename or file["name"])
+        msg.attach(att)
+    elif attach_bytes:
+        print(f"  Attachment too large ({len(attach_bytes) // 1024 // 1024} MB) — Drive link only.")
+        msg = body
+    else:
+        msg = body
 
     msg["Subject"] = subject
     msg["From"] = SENDER_EMAIL
@@ -337,22 +365,22 @@ def main():
 
     # Try up to 5 candidates in case some files have no extractable text
     available = list(files)
-    chosen = content = None
+    chosen = content = attach_bytes = attach_mime = None
     for attempt in range(min(5, len(available))):
         candidate = pick_file(available, history)
         print(f"Selected (attempt {attempt + 1}): {candidate['name']} ({candidate['mimeType']})")
         try:
-            raw = read_file_content(drive_service, candidate)
+            raw, raw_attach, raw_attach_mime = read_file_content(drive_service, candidate)
         except Exception as e:
             print(f"  Could not read file: {e} — skipping.")
             available = [f for f in available if f["id"] != candidate["id"]]
             continue
         # Images are always usable; text must have enough content
         if candidate["mimeType"] in IMAGE_MIME_TYPES:
-            chosen, content = candidate, raw
+            chosen, content, attach_bytes, attach_mime = candidate, raw, raw_attach, raw_attach_mime
             break
         if isinstance(raw, (bytes, str)) and len(raw.strip() if isinstance(raw, str) else raw) > 200:
-            chosen, content = candidate, raw
+            chosen, content, attach_bytes, attach_mime = candidate, raw, raw_attach, raw_attach_mime
             break
         print(f"  Too little text extracted ({len(raw) if raw else 0} chars) — skipping.")
         available = [f for f in available if f["id"] != candidate["id"]]
@@ -364,11 +392,20 @@ def main():
     image_bytes = content if mime in IMAGE_MIME_TYPES else None
     image_mime = mime if mime in IMAGE_MIME_TYPES else None
 
+    # Determine attachment filename (Google Docs get a .pdf extension)
+    attach_filename = chosen["name"]
+    if mime == "application/vnd.google-apps.document" and not attach_filename.endswith(".pdf"):
+        attach_filename += ".pdf"
+
     print("Generating summary with Claude...")
     summary = generate_summary(chosen, content, mime)
 
     print("Building and sending email...")
-    msg = build_mime_message(chosen, summary, image_bytes=image_bytes, image_mime=image_mime)
+    msg = build_mime_message(
+        chosen, summary,
+        image_bytes=image_bytes, image_mime=image_mime,
+        attach_bytes=attach_bytes, attach_filename=attach_filename, attach_mime=attach_mime,
+    )
     send_email(gmail_service, msg)
 
     print("Updating sent history...")
