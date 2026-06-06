@@ -4,7 +4,7 @@ on:
   schedule:
     # 06:00 UTC = 09:00 Athens (EEST, summer) / 08:00 (EET, winter)
     - cron: '0 6 * * *'
-  workflow_dispatch:   # trigger a test run manually from the GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
   send-reading:
@@ -13,6 +13,9 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Use default GITHUB_TOKEN so the bot can push the history update
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -31,3 +34,11 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python scripts/send_reading.py
+
+      - name: Commit updated sent history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/sent_history.json
+          git diff --staged --quiet || git commit -m "chore: update sent history [skip ci]"
+          git push

@@ -4,9 +4,9 @@ Daily reading email: picks a random file from the Drive library,
 summarises it with Claude, and sends it via Gmail API (OAuth).
 
 Required env vars:
-  ANTHROPIC_API_KEY       – Anthropic API key
-  GOOGLE_CREDENTIALS_JSON – JSON string produced by scripts/get_google_token.py
-                            Must include both drive.readonly and gmail.send scopes.
+  ANTHROPIC_API_KEY       - Anthropic API key
+  GOOGLE_CREDENTIALS_JSON - JSON string produced by scripts/get_google_token.py
+                            Must include drive.readonly and gmail.send scopes.
 """
 
 import base64
@@ -14,9 +14,10 @@ import io
 import json
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 import anthropic
 from google.auth.transport.requests import Request
@@ -27,7 +28,12 @@ from googleapiclient.http import MediaIoBaseDownload
 DRIVE_FOLDER_ID = "0B-HXEnqsbXXSZU1Bekpld3UzRVE"
 RECIPIENT_EMAIL = "christos.schizas@gmail.com"
 SENDER_EMAIL = "christos.schizas@gmail.com"
+HISTORY_FILE = Path("data/sent_history.json")
 
+COOLDOWN_PRIMARY = timedelta(days=90)   # don't resend within 3 months
+COOLDOWN_FALLBACK = timedelta(days=30)  # fallback: at least 1 month old
+
+# MIME types we can meaningfully read and summarise
 READABLE_MIME_TYPES = {
     "application/pdf",
     "application/vnd.google-apps.document",
@@ -37,6 +43,19 @@ READABLE_MIME_TYPES = {
     "image/jpg",
     "image/png",
 }
+
+# Types explicitly skipped (logged for visibility)
+EXCLUDED_MIME_TYPES = {
+    "application/vnd.google-apps.spreadsheet",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.google-apps.presentation",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.google-apps.form",
+    "application/vnd.google-apps.drawing",
+}
+
 IMAGE_MIME_TYPES = {"image/jpeg", "image/jpg", "image/png"}
 
 
@@ -57,9 +76,62 @@ def get_google_credentials():
     return creds
 
 
-# ── Drive helpers ────────────────────────────────────────────────────────────
+# ── Sent history ─────────────────────────────────────────────────────────────
+
+def load_history():
+    if HISTORY_FILE.exists():
+        return json.loads(HISTORY_FILE.read_text())
+    return {}
+
+
+def save_history(history, file_id, title):
+    history[file_id] = {
+        "title": title,
+        "last_sent": datetime.now(timezone.utc).isoformat(),
+    }
+    HISTORY_FILE.parent.mkdir(exist_ok=True)
+    HISTORY_FILE.write_text(json.dumps(history, indent=2))
+
+
+def pick_file(files, history):
+    """
+    Priority:
+      1. Files never sent or not sent in the last 90 days  (primary pool)
+      2. Files not sent in the last 30 days               (fallback pool)
+      3. The single file sent least recently              (last resort)
+    """
+    now = datetime.now(timezone.utc)
+
+    def last_sent(f):
+        entry = history.get(f["id"])
+        if not entry:
+            return None
+        ts = entry["last_sent"]
+        dt = datetime.fromisoformat(ts)
+        # Make timezone-aware if stored without tzinfo
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    primary = [f for f in files if last_sent(f) is None or last_sent(f) < now - COOLDOWN_PRIMARY]
+    if primary:
+        print(f"Primary pool: {len(primary)} file(s) available.")
+        return random.choice(primary)
+
+    fallback = [f for f in files if last_sent(f) is None or last_sent(f) < now - COOLDOWN_FALLBACK]
+    if fallback:
+        print(f"Fallback pool ({COOLDOWN_FALLBACK.days}d cooldown): {len(fallback)} file(s) available.")
+        return random.choice(fallback)
+
+    # Last resort: pick the file sent longest ago
+    print("All files sent recently — picking the oldest-sent file.")
+    return min(files, key=lambda f: last_sent(f) or datetime.min.replace(tzinfo=timezone.utc))
+
+
+# ── Drive helpers ─────────────────────────────────────────────────────────────
 
 def list_readable_files(service, folder_id):
+    """Recursively collect readable files; log and skip unsupported types."""
     files = []
     page_token = None
     while True:
@@ -75,10 +147,15 @@ def list_readable_files(service, folder_id):
             .execute()
         )
         for f in resp.get("files", []):
-            if f["mimeType"] == "application/vnd.google-apps.folder":
+            mime = f["mimeType"]
+            if mime == "application/vnd.google-apps.folder":
                 files.extend(list_readable_files(service, f["id"]))
-            elif f["mimeType"] in READABLE_MIME_TYPES:
+            elif mime in READABLE_MIME_TYPES:
                 files.append(f)
+            elif mime in EXCLUDED_MIME_TYPES:
+                print(f"  Skipped (unsupported type {mime}): {f['name']}")
+            else:
+                print(f"  Skipped (unknown type {mime}): {f['name']}")
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
@@ -103,7 +180,7 @@ def read_file_content(service, file):
     return buf.read().decode("utf-8", errors="replace")
 
 
-# ── Summarisation ────────────────────────────────────────────────────────────
+# ── Summarisation ─────────────────────────────────────────────────────────────
 
 def generate_summary(file, content, mime):
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -132,7 +209,7 @@ def generate_summary(file, content, mime):
     return resp.content[0].text
 
 
-# ── Email building ───────────────────────────────────────────────────────────
+# ── Email building ────────────────────────────────────────────────────────────
 
 def _parse_summary(raw):
     exec_sum, kc_html = raw, ""
@@ -198,11 +275,10 @@ def build_email(file, summary):
 </div>
 </body></html>"""
 
-    subject = f"Today's reading: {title}"
-    return subject, html, summary
+    return f"Today's reading: {title}", html, summary
 
 
-# ── Sending via Gmail API ────────────────────────────────────────────────────
+# ── Sending via Gmail API ─────────────────────────────────────────────────────
 
 def send_email(gmail_service, subject, html_body, plain_body):
     msg = MIMEMultipart("alternative")
@@ -216,7 +292,7 @@ def send_email(gmail_service, subject, html_body, plain_body):
     print(f"Sent: {subject}")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     print("Authenticating with Google...")
@@ -224,13 +300,17 @@ def main():
     drive_service = build("drive", "v3", credentials=creds)
     gmail_service = build("gmail", "v1", credentials=creds)
 
-    print("Listing files...")
+    print("Loading sent history...")
+    history = load_history()
+    print(f"  {len(history)} file(s) in history.")
+
+    print("Listing files in Drive library...")
     files = list_readable_files(drive_service, DRIVE_FOLDER_ID)
     if not files:
         raise RuntimeError("No readable files found in the Drive folder.")
-    print(f"Found {len(files)} files.")
+    print(f"Found {len(files)} readable file(s).")
 
-    chosen = random.choice(files)
+    chosen = pick_file(files, history)
     print(f"Selected: {chosen['name']} ({chosen['mimeType']})")
 
     print("Reading content...")
@@ -239,9 +319,13 @@ def main():
     print("Generating summary with Claude...")
     summary = generate_summary(chosen, content, chosen["mimeType"])
 
-    print("Building and sending email...")
+    print("Sending email...")
     subject, html, plain = build_email(chosen, summary)
     send_email(gmail_service, subject, html, plain)
+
+    print("Updating sent history...")
+    save_history(history, chosen["id"], chosen["name"])
+    print("Done.")
 
 
 if __name__ == "__main__":
