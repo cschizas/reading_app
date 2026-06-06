@@ -149,9 +149,13 @@ def list_readable_files(service, folder_id):
 def read_file_content(service, file):
     mime = file["mimeType"]
     fid = file["id"]
+
+    # Google Docs: export as plain text directly
     if mime == "application/vnd.google-apps.document":
         raw = service.files().export(fileId=fid, mimeType="text/plain").execute()
         return raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+    # Download the raw file
     request = service.files().get_media(fileId=fid, supportsAllDrives=True)
     buf = io.BytesIO()
     dl = MediaIoBaseDownload(buf, request)
@@ -159,8 +163,26 @@ def read_file_content(service, file):
     while not done:
         _, done = dl.next_chunk()
     buf.seek(0)
-    # Always return raw bytes for images (we need them for embedding)
-    return buf.read()
+
+    # Images: return raw bytes for inline embedding
+    if mime in IMAGE_MIME_TYPES:
+        return buf.read()
+
+    # PDFs: extract text with pypdf
+    if mime == "application/pdf":
+        import pypdf
+        reader = pypdf.PdfReader(buf)
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n\n".join(p for p in pages if p.strip())
+
+    # Word .docx: extract text with python-docx
+    if mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+        import docx
+        doc = docx.Document(buf)
+        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+    # Fallback for .doc and others
+    return buf.read().decode("utf-8", errors="replace")
 
 
 # ── Summarisation ─────────────────────────────────────────────────────────────
