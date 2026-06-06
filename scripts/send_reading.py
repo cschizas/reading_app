@@ -168,11 +168,11 @@ def read_file_content(service, file):
     if mime in IMAGE_MIME_TYPES:
         return buf.read()
 
-    # PDFs: extract text with pypdf
+    # PDFs: extract text with pdfplumber
     if mime == "application/pdf":
-        import pypdf
-        reader = pypdf.PdfReader(buf)
-        pages = [page.extract_text() or "" for page in reader.pages]
+        import pdfplumber
+        with pdfplumber.open(buf) as pdf:
+            pages = [page.extract_text() or "" for page in pdf.pages]
         return "\n\n".join(p for p in pages if p.strip())
 
     # Word .docx: extract text with python-docx
@@ -335,11 +335,30 @@ def main():
         raise RuntimeError("No readable files found in the Drive folder.")
     print(f"Found {len(files)} readable file(s).")
 
-    chosen = pick_file(files, history)
-    print(f"Selected: {chosen['name']} ({chosen['mimeType']})")
+    # Try up to 5 candidates in case some files have no extractable text
+    available = list(files)
+    chosen = content = None
+    for attempt in range(min(5, len(available))):
+        candidate = pick_file(available, history)
+        print(f"Selected (attempt {attempt + 1}): {candidate['name']} ({candidate['mimeType']})")
+        try:
+            raw = read_file_content(drive_service, candidate)
+        except Exception as e:
+            print(f"  Could not read file: {e} — skipping.")
+            available = [f for f in available if f["id"] != candidate["id"]]
+            continue
+        # Images are always usable; text must have enough content
+        if candidate["mimeType"] in IMAGE_MIME_TYPES:
+            chosen, content = candidate, raw
+            break
+        if isinstance(raw, (bytes, str)) and len(raw.strip() if isinstance(raw, str) else raw) > 200:
+            chosen, content = candidate, raw
+            break
+        print(f"  Too little text extracted ({len(raw) if raw else 0} chars) — skipping.")
+        available = [f for f in available if f["id"] != candidate["id"]]
 
-    print("Reading content...")
-    content = read_file_content(drive_service, chosen)
+    if chosen is None:
+        raise RuntimeError("Could not find a readable file after several attempts.")
 
     mime = chosen["mimeType"]
     image_bytes = content if mime in IMAGE_MIME_TYPES else None
