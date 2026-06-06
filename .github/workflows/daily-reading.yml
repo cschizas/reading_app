@@ -1,0 +1,32 @@
+name: Daily Reading Email
+
+on:
+  schedule:
+    # 06:00 UTC = 09:00 Athens (EEST, summer) / 08:00 (EET, winter)
+    - cron: '0 6 * * *'
+  workflow_dispatch:   # ← lets you trigger a test run manually from GitHub UI
+
+jobs:
+  send-reading:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            anthropic \
+            google-api-python-client \
+            google-auth-httplib2 \
+            google-auth-oauthlib
+
+      - name: Send reading email
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python scripts/send_reading.py
