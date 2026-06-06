@@ -13,6 +13,7 @@ import io
 import json
 import os
 import random
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from email import encoders
 from email.mime.base import MIMEBase
@@ -202,7 +203,10 @@ def generate_summary(file, content, mime):
         "EXECUTIVE SUMMARY\n"
         "2 sentences max. What's the core idea and why does it matter?\n\n"
         "KEY CONCEPTS\n"
-        "3-5 bullet points (start each with '- '). One punchy line each. Bold the concept name."
+        "3-5 bullet points (start each with '- '). One punchy line each. Bold the concept name.\n\n"
+        "RELATED READING\n"
+        "Name 2-3 real articles, essays, or book chapters freely readable online on the same or closely related topic. "
+        "One per line, format: Title — Source. Real titles only, no made-up URLs."
     )
     if mime in IMAGE_MIME_TYPES:
         messages = [{
@@ -225,13 +229,29 @@ def generate_summary(file, content, mime):
 # ── Email building ────────────────────────────────────────────────────────────
 
 def _parse_summary(raw):
-    exec_sum, kc_html = raw, ""
-    if "EXECUTIVE SUMMARY" in raw and "KEY CONCEPTS" in raw:
-        after_exec = raw.split("EXECUTIVE SUMMARY", 1)[1]
-        exec_part, kc_part = after_exec.split("KEY CONCEPTS", 1)
-        exec_sum = exec_part.strip().lstrip(":").strip()
+    exec_sum = raw
+    kc_html = ""
+    related_html = ""
+
+    # Locate each section's content
+    sections = {}
+    for header in ("EXECUTIVE SUMMARY", "KEY CONCEPTS", "RELATED READING"):
+        if header in raw:
+            sections[header] = raw.split(header, 1)[1]
+
+    if "EXECUTIVE SUMMARY" in sections:
+        text = sections["EXECUTIVE SUMMARY"]
+        for stop in ("KEY CONCEPTS", "RELATED READING"):
+            if stop in text:
+                text = text.split(stop, 1)[0]
+        exec_sum = text.strip().lstrip(":").strip()
+
+    if "KEY CONCEPTS" in sections:
+        text = sections["KEY CONCEPTS"]
+        if "RELATED READING" in text:
+            text = text.split("RELATED READING", 1)[0]
         items = []
-        for line in kc_part.strip().lstrip(":").splitlines():
+        for line in text.strip().lstrip(":").splitlines():
             line = line.strip().lstrip("-•*").lstrip("0123456789.)").strip()
             if not line:
                 continue
@@ -243,7 +263,24 @@ def _parse_summary(raw):
                 line = f"<strong>{a.strip()}</strong>: {b.strip()}"
             items.append(f"<li>{line}</li>")
         kc_html = "\n".join(items)
-    return exec_sum, kc_html
+
+    if "RELATED READING" in sections:
+        items = []
+        for line in sections["RELATED READING"].strip().lstrip(":").splitlines():
+            line = line.strip().lstrip("-•*").lstrip("0123456789.)").strip()
+            if not line:
+                continue
+            if " — " in line:
+                title, source = line.split(" — ", 1)
+                title, source = title.strip(), source.strip()
+            else:
+                title, source = line, ""
+            url = "https://duckduckgo.com/?q=" + urllib.parse.quote_plus(title)
+            label = f'{title} <span style="color:#888;font-style:italic">— {source}</span>' if source else title
+            items.append(f'<li><a href="{url}" style="color:#1a2744">{label}</a></li>')
+        related_html = "\n".join(items)
+
+    return exec_sum, kc_html, related_html
 
 
 MAX_ATTACH_BYTES = 20 * 1024 * 1024  # 20 MB — Gmail API limit is 25 MB
@@ -252,11 +289,8 @@ MAX_ATTACH_BYTES = 20 * 1024 * 1024  # 20 MB — Gmail API limit is 25 MB
 def build_mime_message(file, summary, image_bytes=None, image_mime=None,
                        attach_bytes=None, attach_filename=None, attach_mime=None):
     today = datetime.now().strftime("%A, %-d %B %Y")
-    title = file["name"]
-    for ext in (".pdf", ".jpg", ".jpeg", ".png", ".docx", ".doc"):
-        title = title.replace(ext, "")
-    drive_link = file.get("webViewLink", f"https://drive.google.com/file/d/{file['id']}/view")
-    exec_sum, kc_html = _parse_summary(summary)
+    title = Path(file["name"]).stem
+    exec_sum, kc_html, related_html = _parse_summary(summary)
 
     img_tag = '<img src="cid:reading_img" style="max-width:100%;border-radius:6px;margin-top:4px;">' if image_bytes else ""
 
@@ -290,8 +324,7 @@ def build_mime_message(file, summary, image_bytes=None, image_mime=None,
   <div class="lbl">Key takeaways</div>
   <ul>{kc_html}</ul>
   {f'<div class="lbl">Visual</div>{img_tag}' if image_bytes else ""}
-  <div class="lbl">Read it</div>
-  <p><a class="btn" href="{drive_link}">Open in Google Drive →</a></p>
+  {f'<div class="lbl">Related reading</div><ul>{related_html}</ul>' if related_html else ""}
   <div class="foot">Daily reading · {RECIPIENT_EMAIL}</div>
 </div>
 </body></html>"""
